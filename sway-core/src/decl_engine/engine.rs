@@ -1,13 +1,14 @@
+use parking_lot::RwLock;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Write,
-    sync::{Arc, RwLock},
+    sync::Arc,
 };
 
-use sway_types::{ModuleId, Named, Spanned};
+use sway_types::{Named, ProgramId, Spanned};
 
 use crate::{
-    concurrent_slab::{ConcurrentSlab, ListDisplay},
+    concurrent_slab::ConcurrentSlab,
     decl_engine::*,
     engine_threading::*,
     language::ty::{
@@ -48,7 +49,7 @@ impl Clone for DeclEngine {
             constant_slab: self.constant_slab.clone(),
             enum_slab: self.enum_slab.clone(),
             type_alias_slab: self.type_alias_slab.clone(),
-            parents: RwLock::new(self.parents.read().unwrap().clone()),
+            parents: RwLock::new(self.parents.read().clone()),
         }
     }
 }
@@ -183,31 +184,31 @@ decl_engine_index!(constant_slab, ty::TyConstantDecl);
 decl_engine_index!(enum_slab, ty::TyEnumDecl);
 decl_engine_index!(type_alias_slab, ty::TyTypeAliasDecl);
 
-macro_rules! decl_engine_clear_module {
+macro_rules! decl_engine_clear_program {
     ($($slab:ident, $decl:ty);* $(;)?) => {
         impl DeclEngine {
-            pub fn clear_module(&mut self, module_id: &ModuleId) {
-                self.parents.write().unwrap().retain(|key, _| {
+            pub fn clear_program(&mut self, program_id: &ProgramId) {
+                self.parents.write().retain(|key, _| {
                     match key {
                         AssociatedItemDeclId::TraitFn(decl_id) => {
-                            self.get_trait_fn(decl_id).span().source_id().map_or(false, |src_id| &src_id.module_id() != module_id)
+                            self.get_trait_fn(decl_id).span().source_id().map_or(true, |src_id| &src_id.program_id() != program_id)
                         },
                         AssociatedItemDeclId::Function(decl_id) => {
-                            self.get_function(decl_id).span().source_id().map_or(false, |src_id| &src_id.module_id() != module_id)
+                            self.get_function(decl_id).span().source_id().map_or(true, |src_id| &src_id.program_id() != program_id)
                         },
                         AssociatedItemDeclId::Type(decl_id) => {
-                            self.get_type(decl_id).span().source_id().map_or(false, |src_id| &src_id.module_id() != module_id)
+                            self.get_type(decl_id).span().source_id().map_or(true, |src_id| &src_id.program_id() != program_id)
                         },
                         AssociatedItemDeclId::Constant(decl_id) => {
-                            self.get_constant(decl_id).span().source_id().map_or(false, |src_id| &src_id.module_id() != module_id)
+                            self.get_constant(decl_id).span().source_id().map_or(true, |src_id| &src_id.program_id() != program_id)
                         },
                     }
                 });
 
                 $(
                     self.$slab.retain(|_k, ty| match ty.span().source_id() {
-                        Some(source_id) => &source_id.module_id() != module_id,
-                        None => false,
+                        Some(source_id) => &source_id.program_id() != program_id,
+                        None => true,
                     });
                 )*
             }
@@ -215,7 +216,7 @@ macro_rules! decl_engine_clear_module {
     };
 }
 
-decl_engine_clear_module!(
+decl_engine_clear_program!(
     function_slab, ty::TyFunctionDecl;
     trait_slab, ty::TyTraitDecl;
     trait_fn_slab, ty::TyTraitFn;
@@ -244,7 +245,7 @@ impl DeclEngine {
         AssociatedItemDeclId: From<&'a T>,
     {
         let index: AssociatedItemDeclId = AssociatedItemDeclId::from(index);
-        let parents = self.parents.read().unwrap();
+        let parents = self.parents.read();
         let mut acc_parents: HashMap<AssociatedItemDeclId, AssociatedItemDeclId> = HashMap::new();
         let mut already_checked: HashSet<AssociatedItemDeclId> = HashSet::new();
         let mut left_to_check: VecDeque<AssociatedItemDeclId> = VecDeque::from([index]);
@@ -261,11 +262,17 @@ impl DeclEngine {
                         (
                             AssociatedItemDeclId::TraitFn(x_id),
                             AssociatedItemDeclId::TraitFn(curr_parent_id),
-                        ) => self.get(x_id).eq(&self.get(curr_parent_id), engines),
+                        ) => self.get(x_id).eq(
+                            &self.get(curr_parent_id),
+                            &PartialEqWithEnginesContext::new(engines),
+                        ),
                         (
                             AssociatedItemDeclId::Function(x_id),
                             AssociatedItemDeclId::Function(curr_parent_id),
-                        ) => self.get(x_id).eq(&self.get(curr_parent_id), engines),
+                        ) => self.get(x_id).eq(
+                            &self.get(curr_parent_id),
+                            &PartialEqWithEnginesContext::new(engines),
+                        ),
                         _ => false,
                     }) {
                         left_to_check.push_back(curr_parent.clone());
@@ -283,7 +290,7 @@ impl DeclEngine {
     ) where
         AssociatedItemDeclId: From<DeclId<I>>,
     {
-        let mut parents = self.parents.write().unwrap();
+        let mut parents = self.parents.write();
         parents
             .entry(index)
             .and_modify(|e| e.push(parent.clone()))
@@ -441,11 +448,11 @@ impl DeclEngine {
     /// [DisplayWithEngines].
     pub fn pretty_print(&self, engines: &Engines) -> String {
         let mut builder = String::new();
-        let mut list = vec![];
-        for func in self.function_slab.values() {
-            list.push(format!("{:?}", engines.help_out(&*func)));
+        let mut list = String::with_capacity(1024 * 1024);
+        let funcs = self.function_slab.values();
+        for (i, func) in funcs.iter().enumerate() {
+            list.push_str(&format!("{i} - {:?}\n", engines.help_out(func)));
         }
-        let list = ListDisplay { list };
         write!(builder, "DeclEngine {{\n{list}\n}}").unwrap();
         builder
     }

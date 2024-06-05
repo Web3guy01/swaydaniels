@@ -244,7 +244,7 @@ fn depends_on(
         (AstNodeContent::UseStatement(_), AstNodeContent::UseStatement(_)) => false,
         (_, AstNodeContent::UseStatement(_)) => true,
 
-        // Then declarations, ordered using the dependecies list.
+        // Then declarations, ordered using the dependencies list.
         (AstNodeContent::IncludeStatement(_), AstNodeContent::Declaration(_)) => false,
         (AstNodeContent::UseStatement(_), AstNodeContent::Declaration(_)) => false,
         (AstNodeContent::Declaration(dependant), AstNodeContent::Declaration(dependee)) => {
@@ -337,6 +337,7 @@ impl Dependencies {
                 })
                 .gather_from_type_parameters(type_parameters)
             }
+            Declaration::EnumVariantDeclaration(_decl) => unreachable!(),
             Declaration::TraitDeclaration(decl_id) => {
                 let trait_decl = engines.pe().get_trait(decl_id);
                 self.gather_from_iter(trait_decl.supertraits.iter(), |deps, sup| {
@@ -345,11 +346,13 @@ impl Dependencies {
                 .gather_from_iter(
                     trait_decl.interface_surface.iter(),
                     |deps, item| match item {
-                        TraitItem::TraitFn(sig) => deps
-                            .gather_from_iter(sig.parameters.iter(), |deps, param| {
+                        TraitItem::TraitFn(decl_id) => {
+                            let sig = engines.pe().get_trait_fn(decl_id);
+                            deps.gather_from_iter(sig.parameters.iter(), |deps, param| {
                                 deps.gather_from_type_argument(engines, &param.type_argument)
                             })
-                            .gather_from_type_argument(engines, &sig.return_type),
+                            .gather_from_type_argument(engines, &sig.return_type)
+                        }
                         TraitItem::Constant(decl_id) => {
                             let const_decl = engines.pe().get_constant(decl_id);
                             deps.gather_from_constant_decl(engines, &const_decl)
@@ -429,11 +432,13 @@ impl Dependencies {
                     deps.gather_from_call_path(&sup.name, false, false)
                 })
                 .gather_from_iter(interface_surface.iter(), |deps, item| match item {
-                    TraitItem::TraitFn(sig) => deps
-                        .gather_from_iter(sig.parameters.iter(), |deps, param| {
+                    TraitItem::TraitFn(decl_id) => {
+                        let sig = engines.pe().get_trait_fn(decl_id);
+                        deps.gather_from_iter(sig.parameters.iter(), |deps, param| {
                             deps.gather_from_type_argument(engines, &param.type_argument)
                         })
-                        .gather_from_type_argument(engines, &sig.return_type),
+                        .gather_from_type_argument(engines, &sig.return_type)
+                    }
                     TraitItem::Constant(decl_id) => {
                         let const_decl = engines.pe().get_constant(decl_id);
                         deps.gather_from_constant_decl(engines, &const_decl)
@@ -887,6 +892,7 @@ fn decl_name(engines: &Engines, decl: &Declaration) -> Option<DependentSymbol> {
             let decl = engines.pe().get_enum(decl_id);
             dep_sym(decl.name.clone())
         }
+        Declaration::EnumVariantDeclaration(_decl) => None,
         Declaration::TraitDeclaration(decl_id) => {
             let decl = engines.pe().get_trait(decl_id);
             dep_sym(decl.name.clone())
@@ -1005,7 +1011,7 @@ fn type_info_name(type_info: &TypeInfo) -> String {
         TypeInfo::Slice(..) => "__slice",
         TypeInfo::Alias { .. } => "alias",
         TypeInfo::TraitType { .. } => "trait type",
-        TypeInfo::Ref(..) => "reference type",
+        TypeInfo::Ref { .. } => "reference type",
     }
     .to_string()
 }
@@ -1024,7 +1030,3 @@ fn recursively_depends_on(
                 .unwrap_or(false)
         })
 }
-
-// -------------------------------------------------------------------------------------------------
-//
-//

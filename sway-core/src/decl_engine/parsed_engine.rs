@@ -2,14 +2,14 @@ use crate::{
     concurrent_slab::ConcurrentSlab,
     decl_engine::*,
     language::parsed::{
-        AbiDeclaration, ConstantDeclaration, EnumDeclaration, FunctionDeclaration, ImplSelf,
-        ImplTrait, StorageDeclaration, StructDeclaration, TraitDeclaration, TraitFn,
+        AbiDeclaration, ConstantDeclaration, EnumDeclaration, EnumVariant, FunctionDeclaration,
+        ImplSelf, ImplTrait, StorageDeclaration, StructDeclaration, TraitDeclaration, TraitFn,
         TraitTypeDeclaration, TypeAliasDeclaration, VariableDeclaration,
     },
 };
 
 use std::sync::Arc;
-use sway_types::{ModuleId, Spanned};
+use sway_types::{ProgramId, Spanned};
 
 use super::parsed_id::ParsedDeclId;
 
@@ -28,6 +28,7 @@ pub struct ParsedDeclEngine {
     abi_slab: ConcurrentSlab<AbiDeclaration>,
     constant_slab: ConcurrentSlab<ConstantDeclaration>,
     enum_slab: ConcurrentSlab<EnumDeclaration>,
+    enum_variant_slab: ConcurrentSlab<EnumVariant>,
     type_alias_slab: ConcurrentSlab<TypeAliasDeclaration>,
 }
 
@@ -73,6 +74,7 @@ decl_engine_get!(storage_slab, StorageDeclaration);
 decl_engine_get!(abi_slab, AbiDeclaration);
 decl_engine_get!(constant_slab, ConstantDeclaration);
 decl_engine_get!(enum_slab, EnumDeclaration);
+decl_engine_get!(enum_variant_slab, EnumVariant);
 decl_engine_get!(type_alias_slab, TypeAliasDeclaration);
 
 macro_rules! decl_engine_insert {
@@ -102,6 +104,7 @@ decl_engine_insert!(storage_slab, StorageDeclaration);
 decl_engine_insert!(abi_slab, AbiDeclaration);
 decl_engine_insert!(constant_slab, ConstantDeclaration);
 decl_engine_insert!(enum_slab, EnumDeclaration);
+decl_engine_insert!(enum_variant_slab, EnumVariant);
 decl_engine_insert!(type_alias_slab, TypeAliasDeclaration);
 
 macro_rules! decl_engine_clear {
@@ -132,17 +135,17 @@ decl_engine_clear!(
     type_alias_slab, TypeAliasDeclaration;
 );
 
-macro_rules! decl_engine_clear_module {
+macro_rules! decl_engine_clear_program {
     ($(($slab:ident, $getter:expr)),* $(,)?) => {
         impl ParsedDeclEngine {
-            pub fn clear_module(&mut self, module_id: &ModuleId) {
+            pub fn clear_program(&mut self, program_id: &ProgramId) {
                 $(
                     self.$slab.retain(|_k, item| {
                         #[allow(clippy::redundant_closure_call)]
                         let span = $getter(item);
                         match span.source_id() {
-                            Some(source_id) => &source_id.module_id() != module_id,
-                            None => false,
+                            Some(source_id) => &source_id.program_id() != program_id,
+                            None => true,
                         }
                     });
                 )*
@@ -151,7 +154,7 @@ macro_rules! decl_engine_clear_module {
     };
 }
 
-decl_engine_clear_module!(
+decl_engine_clear_program!(
     (variable_slab, |item: &VariableDeclaration| item.name.span()),
     (function_slab, |item: &FunctionDeclaration| item.name.span()),
     (trait_slab, |item: &TraitDeclaration| item.name.span()),
@@ -309,6 +312,18 @@ impl ParsedDeclEngine {
     ///
     /// Calling [ParsedDeclEngine][get] directly is equivalent to this method, but
     /// this method adds additional syntax that some users may find helpful.
+    pub fn get_enum_variant<I>(&self, index: &I) -> Arc<EnumVariant>
+    where
+        ParsedDeclEngine: ParsedDeclEngineGet<I, EnumVariant>,
+    {
+        self.get(index)
+    }
+
+    /// Friendly helper method for calling the `get` method from the
+    /// implementation of [ParsedDeclEngineGet] for [ParsedDeclEngine]
+    ///
+    /// Calling [ParsedDeclEngine][get] directly is equivalent to this method, but
+    /// this method adds additional syntax that some users may find helpful.
     pub fn get_type_alias<I>(&self, index: &I) -> Arc<TypeAliasDeclaration>
     where
         ParsedDeclEngine: ParsedDeclEngineGet<I, TypeAliasDeclaration>,
@@ -326,5 +341,23 @@ impl ParsedDeclEngine {
         ParsedDeclEngine: ParsedDeclEngineGet<I, VariableDeclaration>,
     {
         self.get(index)
+    }
+
+    pub fn pretty_print(&self) -> String {
+        use std::fmt::Write;
+        let mut s = String::new();
+        let _ = write!(
+            &mut s,
+            "Function Count: {}",
+            self.function_slab.values().len()
+        );
+        for f in self.function_slab.values() {
+            let _ = write!(&mut s, "Function: {}", f.name);
+            for node in f.body.contents.iter() {
+                let _ = write!(&mut s, "    Node: {:#?}", node);
+            }
+        }
+
+        s
     }
 }

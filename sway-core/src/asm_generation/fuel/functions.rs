@@ -1,7 +1,11 @@
 use crate::{
     asm_generation::{
         from_ir::*,
-        fuel::{compiler_constants, data_section::Entry, fuel_asm_builder::FuelAsmBuilder},
+        fuel::{
+            compiler_constants::{self, TWELVE_BITS},
+            data_section::Entry,
+            fuel_asm_builder::FuelAsmBuilder,
+        },
         ProgramKind,
     },
     asm_lang::{
@@ -123,19 +127,49 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
             }
             // Register ARG_REGS[NUM_ARG_REGISTERS-1] must contain LocalsBase + locals_size
             // so that the callee can index the stack arguments from there.
-            self.cur_bytecode.push(Op {
-                opcode: Either::Left(VirtualOp::ADDI(
-                    VirtualRegister::Constant(
-                        ConstantRegister::ARG_REGS
-                            [(compiler_constants::NUM_ARG_REGISTERS - 1) as usize],
-                    ),
-                    VirtualRegister::Constant(ConstantRegister::LocalsBase),
-                    VirtualImmediate12::new(self.locals_size_bytes(), Span::dummy())
-                        .expect("Too many arguments, cannot handle."),
-                )),
-                comment: "Save address of stack arguments in last arg register".to_string(),
-                owning_span: self.md_mgr.val_to_span(self.context, *instr_val),
-            });
+            if self.locals_size_bytes() <= TWELVE_BITS {
+                self.cur_bytecode.push(Op {
+                    opcode: Either::Left(VirtualOp::ADDI(
+                        VirtualRegister::Constant(
+                            ConstantRegister::ARG_REGS
+                                [(compiler_constants::NUM_ARG_REGISTERS - 1) as usize],
+                        ),
+                        VirtualRegister::Constant(ConstantRegister::LocalsBase),
+                        VirtualImmediate12::new(self.locals_size_bytes(), Span::dummy())
+                            .expect("Stack size too big for these many arguments, cannot handle."),
+                    )),
+                    comment: "Save address of stack arguments in last arg register".to_string(),
+                    owning_span: self.md_mgr.val_to_span(self.context, *instr_val),
+                });
+            } else {
+                self.cur_bytecode.push(Op {
+                    opcode: Either::Left(VirtualOp::MOVI(
+                        VirtualRegister::Constant(
+                            ConstantRegister::ARG_REGS
+                                [(compiler_constants::NUM_ARG_REGISTERS - 1) as usize],
+                        ),
+                        VirtualImmediate18::new(self.locals_size_bytes(), Span::dummy())
+                            .expect("Stack size too big for these many arguments, cannot handle."),
+                    )),
+                    comment: "Temporarily save the locals size to add up next".to_string(),
+                    owning_span: self.md_mgr.val_to_span(self.context, *instr_val),
+                });
+                self.cur_bytecode.push(Op {
+                    opcode: Either::Left(VirtualOp::ADD(
+                        VirtualRegister::Constant(
+                            ConstantRegister::ARG_REGS
+                                [(compiler_constants::NUM_ARG_REGISTERS - 1) as usize],
+                        ),
+                        VirtualRegister::Constant(ConstantRegister::LocalsBase),
+                        VirtualRegister::Constant(
+                            ConstantRegister::ARG_REGS
+                                [(compiler_constants::NUM_ARG_REGISTERS - 1) as usize],
+                        ),
+                    )),
+                    comment: "Save address of stack arguments in last arg register".to_string(),
+                    owning_span: self.md_mgr.val_to_span(self.context, *instr_val),
+                });
+            }
         }
 
         // Set a new return address.
@@ -305,7 +339,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
 
             // Free our stack allocated locals.  This is unneeded for entries since they will have
             // actually returned to the calling context via a VM RET.
-            self.drop_locals(function);
+            self.drop_locals();
 
             // Restore $reta.
             self.cur_bytecode.push(Op::register_move(
@@ -584,7 +618,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
 
     /// Read the returns the base pointer for predicate data
     fn read_args_base_from_predicate_data(&mut self, base_reg: &VirtualRegister) {
-        // Final label to jump to to continue execution, once the predicate data pointer is
+        // Final label to jump to continue execution, once the predicate data pointer is
         // successfully found
         let success_label = self.reg_seqr.get_label();
 
@@ -812,7 +846,11 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
         self.cur_bytecode.push(Op::register_move(
             locals_base_reg.clone(),
             VirtualRegister::Constant(ConstantRegister::StackPointer),
-            "save locals base register",
+            format!(
+                "save locals base register for {}",
+                function.get_name(self.context)
+            )
+            .to_string(),
             None,
         ));
 
@@ -851,6 +889,10 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
             data_id,
         } in init_mut_vars
         {
+            if var_size.in_bytes() == 0 {
+                // Don't bother initializing zero-sized types.
+                continue;
+            }
             // Load our initialiser from the data section.
             self.cur_bytecode.push(Op {
                 opcode: Either::Left(VirtualOp::LoadDataId(
@@ -946,7 +988,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
             .push((locals_size_bytes, locals_base_reg, max_num_extra_args));
     }
 
-    fn drop_locals(&mut self, _function: Function) {
+    pub(super) fn drop_locals(&mut self) {
         let (locals_size_bytes, max_num_extra_args) =
             (self.locals_size_bytes(), self.max_num_extra_args());
         if locals_size_bytes > compiler_constants::TWENTY_FOUR_BITS {

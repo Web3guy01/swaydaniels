@@ -9,6 +9,8 @@ use shellfish::{async_fn, Command as ShCommand, Shell};
 use std::error::Error;
 
 #[derive(Parser, Debug)]
+#[clap(name = "forc-debug", version)]
+/// Forc plugin for the Sway DAP (Debug Adapter Protocol) implementation.
 pub struct Opt {
     /// The URL of the Fuel Client GraphQL API
     #[clap(default_value = "http://127.0.0.1:4000/graphql")]
@@ -78,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     command!(cmd_memory, "[offset] limit -- dump memory", ["m", "memory"]);
 
     let session_id = shell.state.client.start_session().await?;
-    shell.state.session_id = session_id.clone();
+    shell.state.session_id.clone_from(&session_id);
     shell.run_async().await?;
     shell.state.client.end_session(&session_id).await?;
     Ok(())

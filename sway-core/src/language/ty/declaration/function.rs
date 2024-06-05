@@ -7,7 +7,12 @@ use std::{
 use sha2::{Digest, Sha256};
 use sway_error::handler::{ErrorEmitted, Handler};
 
-use crate::{language::CallPath, semantic_analysis::type_check_context::MonomorphizeHelper};
+use crate::{
+    has_changes,
+    language::{parsed::FunctionDeclarationKind, CallPath},
+    semantic_analysis::type_check_context::MonomorphizeHelper,
+    transform::AttributeKind,
+};
 
 use crate::{
     decl_engine::*,
@@ -23,6 +28,14 @@ use sway_types::{
     constants::{INLINE_ALWAYS_NAME, INLINE_NEVER_NAME},
     Ident, Named, Span, Spanned,
 };
+
+#[derive(Clone, Debug)]
+pub enum TyFunctionDeclKind {
+    Default,
+    Entry,
+    Main,
+    Test,
+}
 
 #[derive(Clone, Debug)]
 pub struct TyFunctionDecl {
@@ -42,13 +55,14 @@ pub struct TyFunctionDecl {
     pub purity: Purity,
     pub where_clause: Vec<(Ident, Vec<TraitConstraint>)>,
     pub is_trait_method_dummy: bool,
+    pub kind: TyFunctionDeclKind,
 }
 
 impl DebugWithEngines for TyFunctionDecl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, engines: &Engines) -> fmt::Result {
         write!(
             f,
-            "{}{:?}{}({}):{}",
+            "{}{:?}{}({}):{}->{}",
             if self.is_trait_method_dummy {
                 "dummy ".to_string()
             } else {
@@ -60,7 +74,11 @@ impl DebugWithEngines for TyFunctionDecl {
                     "<{}>",
                     self.type_parameters
                         .iter()
-                        .map(|p| format!("{:?}", engines.help_out(p.initial_type_id)))
+                        .map(|p| format!(
+                            "{:?} -> {:?}",
+                            engines.help_out(p.initial_type_id),
+                            engines.help_out(p.type_id)
+                        ))
                         .collect::<Vec<_>>()
                         .join(", ")
                 )
@@ -77,6 +95,7 @@ impl DebugWithEngines for TyFunctionDecl {
                 .collect::<Vec<_>>()
                 .join(", "),
             engines.help_out(self.return_type.initial_type_id),
+            engines.help_out(self.return_type.type_id),
         )
     }
 }
@@ -131,12 +150,12 @@ impl declaration::FunctionSignature for TyFunctionDecl {
 
 impl EqWithEngines for TyFunctionDecl {}
 impl PartialEqWithEngines for TyFunctionDecl {
-    fn eq(&self, other: &Self, engines: &Engines) -> bool {
+    fn eq(&self, other: &Self, ctx: &PartialEqWithEnginesContext) -> bool {
         self.name == other.name
-            && self.body.eq(&other.body, engines)
-            && self.parameters.eq(&other.parameters, engines)
-            && self.return_type.eq(&other.return_type, engines)
-            && self.type_parameters.eq(&other.type_parameters, engines)
+            && self.body.eq(&other.body, ctx)
+            && self.parameters.eq(&other.parameters, ctx)
+            && self.return_type.eq(&other.return_type, ctx)
+            && self.type_parameters.eq(&other.type_parameters, ctx)
             && self.visibility == other.visibility
             && self.is_contract_call == other.is_contract_call
             && self.purity == other.purity
@@ -163,6 +182,7 @@ impl HashWithEngines for TyFunctionDecl {
             implementing_for_typeid: _,
             where_clause: _,
             is_trait_method_dummy: _,
+            kind: _,
         } = self;
         name.hash(state);
         body.hash(state, engines);
@@ -176,17 +196,13 @@ impl HashWithEngines for TyFunctionDecl {
 }
 
 impl SubstTypes for TyFunctionDecl {
-    fn subst_inner(&mut self, type_mapping: &TypeSubstMap, engines: &Engines) {
-        self.type_parameters
-            .iter_mut()
-            .for_each(|x| x.subst(type_mapping, engines));
-        self.parameters
-            .iter_mut()
-            .for_each(|x| x.subst(type_mapping, engines));
-        self.return_type.subst(type_mapping, engines);
-        self.body.subst(type_mapping, engines);
-        if let Some(implementing_for) = self.implementing_for_typeid.as_mut() {
-            implementing_for.subst(type_mapping, engines);
+    fn subst_inner(&mut self, type_mapping: &TypeSubstMap, engines: &Engines) -> HasChanges {
+        has_changes! {
+            self.type_parameters.subst(type_mapping, engines);
+            self.parameters.subst(type_mapping, engines);
+            self.return_type.subst(type_mapping, engines);
+            self.body.subst(type_mapping, engines);
+            self.implementing_for_typeid.subst(type_mapping, engines);
         }
     }
 }
@@ -197,7 +213,7 @@ impl ReplaceDecls for TyFunctionDecl {
         decl_mapping: &DeclMapping,
         handler: &Handler,
         ctx: &mut TypeCheckContext,
-    ) -> Result<(), ErrorEmitted> {
+    ) -> Result<bool, ErrorEmitted> {
         let mut func_ctx = ctx.by_ref().with_self_type(self.implementing_for_typeid);
         self.body
             .replace_decls(decl_mapping, handler, &mut func_ctx)
@@ -244,9 +260,12 @@ impl UnconstrainedTypeParameters for TyFunctionDecl {
         all_types.extend(self.return_type.type_id.extract_inner_types(engines));
         all_types.insert(self.return_type.type_id);
         let type_parameter_info = type_engine.get(type_parameter.type_id);
-        all_types
-            .iter()
-            .any(|type_id| type_engine.get(*type_id).eq(&type_parameter_info, engines))
+        all_types.iter().any(|type_id| {
+            type_engine.get(*type_id).eq(
+                &type_parameter_info,
+                &PartialEqWithEnginesContext::new(engines),
+            )
+        })
     }
 }
 
@@ -296,6 +315,7 @@ impl TyFunctionDecl {
             visibility,
             purity,
             where_clause,
+            kind,
             ..
         } = decl;
         TyFunctionDecl {
@@ -314,6 +334,12 @@ impl TyFunctionDecl {
             type_parameters: Default::default(),
             where_clause: where_clause.clone(),
             is_trait_method_dummy: false,
+            kind: match kind {
+                FunctionDeclarationKind::Default => TyFunctionDeclKind::Default,
+                FunctionDeclarationKind::Entry => TyFunctionDeclKind::Entry,
+                FunctionDeclarationKind::Test => TyFunctionDeclKind::Test,
+                FunctionDeclarationKind::Main => TyFunctionDeclKind::Main,
+            },
         }
     }
 
@@ -324,7 +350,7 @@ impl TyFunctionDecl {
                 // TODO: Use Span::join_all().
                 self.parameters[0].name.span(),
                 |acc, TyFunctionParameter { type_argument, .. }| {
-                    Span::join(acc, type_argument.span.clone())
+                    Span::join(acc, &type_argument.span)
                 },
             )
         } else {
@@ -385,14 +411,17 @@ impl TyFunctionDecl {
     }
 
     /// Whether or not this function is the default entry point.
-    pub fn is_main_entry(&self) -> bool {
-        // NOTE: We may want to make this check more sophisticated or customisable in the future,
-        // but for now this assumption is baked in throughout the compiler.
-        self.name.as_str() == sway_types::constants::DEFAULT_ENTRY_POINT_FN_NAME
+    pub fn is_entry(&self) -> bool {
+        matches!(self.kind, TyFunctionDeclKind::Entry)
+    }
+
+    pub fn is_main(&self) -> bool {
+        matches!(self.kind, TyFunctionDeclKind::Main)
     }
 
     /// Whether or not this function is a unit test, i.e. decorated with `#[test]`.
     pub fn is_test(&self) -> bool {
+        //TODO match kind to Test
         self.attributes
             .contains_key(&transform::AttributeKind::Test)
     }
@@ -413,9 +442,8 @@ impl TyFunctionDecl {
         }
     }
 
-    /// Whether or not this function describes a program entry point.
-    pub fn is_entry(&self) -> bool {
-        self.is_main_entry() || self.is_test()
+    pub fn is_fallback(&self) -> bool {
+        self.attributes.contains_key(&AttributeKind::Fallback)
     }
 
     /// Whether or not this function is a constructor for the type given by `type_id`.
@@ -467,9 +495,9 @@ pub struct TyFunctionParameter {
 
 impl EqWithEngines for TyFunctionParameter {}
 impl PartialEqWithEngines for TyFunctionParameter {
-    fn eq(&self, other: &Self, engines: &Engines) -> bool {
+    fn eq(&self, other: &Self, ctx: &PartialEqWithEnginesContext) -> bool {
         self.name == other.name
-            && self.type_argument.eq(&other.type_argument, engines)
+            && self.type_argument.eq(&other.type_argument, ctx)
             && self.is_reference == other.is_reference
             && self.is_mutable == other.is_mutable
     }
@@ -494,8 +522,8 @@ impl HashWithEngines for TyFunctionParameter {
 }
 
 impl SubstTypes for TyFunctionParameter {
-    fn subst_inner(&mut self, type_mapping: &TypeSubstMap, engines: &Engines) {
-        self.type_argument.type_id.subst(type_mapping, engines);
+    fn subst_inner(&mut self, type_mapping: &TypeSubstMap, engines: &Engines) -> HasChanges {
+        self.type_argument.type_id.subst(type_mapping, engines)
     }
 }
 

@@ -11,6 +11,7 @@ mod build_config;
 pub mod compiler_generated;
 mod concurrent_slab;
 mod control_flow_analysis;
+mod debug_generation;
 pub mod decl_engine;
 pub mod ir_generation;
 pub mod language;
@@ -27,8 +28,9 @@ use crate::source_map::SourceMap;
 pub use asm_generation::from_ir::compile_ir_to_asm;
 use asm_generation::FinalizedAsm;
 pub use asm_generation::{CompiledBytecode, FinalizedEntry};
-pub use build_config::{BuildConfig, BuildTarget, LspConfig, OptLevel};
+pub use build_config::{BuildConfig, BuildTarget, LspConfig, OptLevel, PrintAsm, PrintIr};
 use control_flow_analysis::ControlFlowGraph;
+pub use debug_generation::write_dwarf;
 use indexmap::IndexMap;
 use metadata::MetadataManager;
 use query_engine::{ModuleCacheKey, ModulePath, ProgramsCacheEntry};
@@ -41,15 +43,15 @@ use sway_ast::AttributeDecl;
 use sway_error::handler::{ErrorEmitted, Handler};
 use sway_ir::{
     create_o1_pass_group, register_known_passes, Context, Kind, Module, PassGroup, PassManager,
-    ARGDEMOTION_NAME, CONSTDEMOTION_NAME, DCE_NAME, INLINE_MODULE_NAME, MEM2REG_NAME,
-    MEMCPYOPT_NAME, MISCDEMOTION_NAME, MODULEPRINTER_NAME, RETDEMOTION_NAME, SIMPLIFYCFG_NAME,
-    SROA_NAME,
+    PrintPassesOpts, ARG_DEMOTION_NAME, CONST_DEMOTION_NAME, DCE_NAME, FN_DCE_NAME,
+    FN_DEDUP_DEBUG_PROFILE_NAME, FN_INLINE_NAME, MEM2REG_NAME, MEMCPYOPT_NAME, MISC_DEMOTION_NAME,
+    RET_DEMOTION_NAME, SIMPLIFY_CFG_NAME, SROA_NAME,
 };
 use sway_types::constants::DOC_COMMENT_ATTRIBUTE_NAME;
 use sway_types::SourceEngine;
 use sway_utils::{time_expr, PerformanceData, PerformanceMetric};
 use transform::{Attribute, AttributeArg, AttributeKind, AttributesMap};
-use types::*;
+use types::{CollectTypesMetadata, CollectTypesMetadataContext, TypeMetadata};
 
 pub use semantic_analysis::namespace::{self, Namespace};
 pub mod types;
@@ -89,7 +91,14 @@ pub fn parse(
     config: Option<&BuildConfig>,
 ) -> Result<(lexed::LexedProgram, parsed::ParseProgram), ErrorEmitted> {
     match config {
-        None => parse_in_memory(handler, engines, input),
+        None => parse_in_memory(
+            handler,
+            engines,
+            input,
+            ExperimentalFlags {
+                new_encoding: false,
+            },
+        ),
         // When a `BuildConfig` is given,
         // the module source may declare `dep`s that must be parsed from other files.
         Some(config) => parse_module_tree(
@@ -101,6 +110,7 @@ pub fn parse(
             config.build_target,
             config.include_tests,
             config.experimental,
+            config.lsp_mode.as_ref(),
         )
         .map(
             |ParsedModuleTree {
@@ -109,7 +119,7 @@ pub fn parse(
                  parse_module,
              }| {
                 let lexed = lexed::LexedProgram {
-                    kind: kind.clone(),
+                    kind,
                     root: lexed_module,
                 };
                 let parsed = parsed::ParseProgram {
@@ -188,6 +198,7 @@ fn parse_in_memory(
     handler: &Handler,
     engines: &Engines,
     src: Arc<str>,
+    experimental: ExperimentalFlags,
 ) -> Result<(lexed::LexedProgram, parsed::ParseProgram), ErrorEmitted> {
     let mut hasher = DefaultHasher::new();
     src.hash(&mut hasher);
@@ -195,27 +206,28 @@ fn parse_in_memory(
     let module = sway_parse::parse_file(handler, src, None)?;
 
     let (kind, tree) = to_parsed_lang::convert_parse_tree(
-        &mut to_parsed_lang::Context::default(),
+        &mut to_parsed_lang::Context::new(BuildTarget::EVM, experimental),
         handler,
         engines,
         module.value.clone(),
     )?;
     let module_kind_span = module.value.kind.span();
-    let submodules = Default::default();
+    let submodules = Vec::default();
     let attributes = module_attrs_to_map(handler, &module.attribute_list)?;
     let root = parsed::ParseModule {
         span: span::Span::dummy(),
         module_kind_span,
+        module_eval_order: vec![],
         tree,
         submodules,
         attributes,
         hash,
     };
     let lexed_program = lexed::LexedProgram::new(
-        kind.clone(),
+        kind,
         lexed::LexedModule {
             tree: module.value,
-            submodules: Default::default(),
+            submodules: Vec::default(),
         },
     );
 
@@ -243,6 +255,7 @@ fn parse_submodules(
     build_target: BuildTarget,
     include_tests: bool,
     experimental: ExperimentalFlags,
+    lsp_mode: Option<&LspConfig>,
 ) -> Submodules {
     // Assume the happy path, so there'll be as many submodules as dependencies, but no more.
     let mut submods = Vec::with_capacity(module.submodules().count());
@@ -276,6 +289,7 @@ fn parse_submodules(
             build_target,
             include_tests,
             experimental,
+            lsp_mode,
         ) {
             if !matches!(kind, parsed::TreeType::Library) {
                 let source_id = engines.se().get_source_id(submod_path.as_ref());
@@ -329,6 +343,7 @@ fn parse_module_tree(
     build_target: BuildTarget,
     include_tests: bool,
     experimental: ExperimentalFlags,
+    lsp_mode: Option<&LspConfig>,
 ) -> Result<ParsedModuleTree, ErrorEmitted> {
     let query_engine = engines.qe();
 
@@ -348,6 +363,7 @@ fn parse_module_tree(
         build_target,
         include_tests,
         experimental,
+        lsp_mode,
     );
 
     // Convert from the raw parsed module to the `ParseTree` ready for type-check.
@@ -380,6 +396,7 @@ fn parse_module_tree(
     let parsed = parsed::ParseModule {
         span: span::Span::new(src, 0, 0, Some(source_id)).unwrap(),
         module_kind_span,
+        module_eval_order: vec![],
         tree,
         submodules: parsed_submodules,
         attributes,
@@ -391,57 +408,73 @@ fn parse_module_tree(
         .ok()
         .and_then(|m| m.modified().ok());
     let dependencies = submodules.into_iter().map(|s| s.path).collect::<Vec<_>>();
-    let parsed_module_tree = ParsedModuleTree {
-        tree_type: kind,
-        lexed_module: lexed,
-        parse_module: parsed,
-    };
+    let version = lsp_mode
+        .and_then(|lsp| lsp.file_versions.get(path.as_ref()).copied())
+        .unwrap_or(None);
     let cache_entry = ModuleCacheEntry {
         path,
         modified_time,
         hash,
         dependencies,
         include_tests,
+        version,
     };
     query_engine.insert_parse_module_cache_entry(cache_entry);
 
-    Ok(parsed_module_tree)
+    Ok(ParsedModuleTree {
+        tree_type: kind,
+        lexed_module: lexed,
+        parse_module: parsed,
+    })
 }
 
 fn is_parse_module_cache_up_to_date(
     engines: &Engines,
     path: &Arc<PathBuf>,
     include_tests: bool,
+    build_config: Option<&BuildConfig>,
 ) -> bool {
     let query_engine = engines.qe();
     let key = ModuleCacheKey::new(path.clone(), include_tests);
     let entry = query_engine.get_parse_module_cache_entry(&key);
     match entry {
         Some(entry) => {
-            let modified_time = std::fs::metadata(path.as_path())
-                .ok()
-                .and_then(|m| m.modified().ok());
-
             // Let's check if we can re-use the dependency information
-            // we got from the cache, which is only true if the file hasn't been
-            // modified since or if its hash is the same.
-            let cache_up_to_date = entry.modified_time == modified_time || {
-                let src = std::fs::read_to_string(path.as_path()).unwrap();
-
-                let mut hasher = DefaultHasher::new();
-                src.hash(&mut hasher);
-                let hash = hasher.finish();
-
-                hash == entry.hash
-            };
+            // we got from the cache.
+            let cache_up_to_date = build_config
+                .as_ref()
+                .and_then(|x| x.lsp_mode.as_ref())
+                .and_then(|lsp| {
+                    // First try to get the file version from lsp if it exists
+                    lsp.file_versions.get(path.as_ref())
+                })
+                .map_or_else(
+                    || {
+                        // Otherwise we can safely read the file from disk here, as the LSP has not modified it, or we are not in LSP mode.
+                        // Check if the file has been modified or if its hash is the same as the last compilation
+                        let modified_time = std::fs::metadata(path.as_path())
+                            .ok()
+                            .and_then(|m| m.modified().ok());
+                        entry.modified_time == modified_time || {
+                            let src = std::fs::read_to_string(path.as_path()).unwrap();
+                            let mut hasher = DefaultHasher::new();
+                            src.hash(&mut hasher);
+                            let hash = hasher.finish();
+                            hash == entry.hash
+                        }
+                    },
+                    |version| {
+                        // The cache is invalid if the lsp version is greater than the last compilation
+                        !version.map_or(false, |v| v > entry.version.unwrap_or(0))
+                    },
+                );
 
             // Look at the dependencies recursively to make sure they have not been
             // modified either.
             if cache_up_to_date {
-                entry
-                    .dependencies
-                    .iter()
-                    .all(|path| is_parse_module_cache_up_to_date(engines, path, include_tests))
+                entry.dependencies.iter().all(|path| {
+                    is_parse_module_cache_up_to_date(engines, path, include_tests, build_config)
+                })
             } else {
                 false
             }
@@ -468,19 +501,43 @@ fn module_path(
     }
 }
 
+pub fn build_module_dep_graph(
+    handler: &Handler,
+    parse_module: &mut parsed::ParseModule,
+) -> Result<(), ErrorEmitted> {
+    let module_dep_graph = ty::TyModule::build_dep_graph(handler, parse_module)?;
+    parse_module.module_eval_order = module_dep_graph.compute_order(handler)?;
+
+    for (_, submodule) in &mut parse_module.submodules {
+        build_module_dep_graph(handler, &mut submodule.module)?;
+    }
+    Ok(())
+}
+
 pub struct CompiledAsm(pub FinalizedAsm);
 
 pub fn parsed_to_ast(
     handler: &Handler,
     engines: &Engines,
-    parse_program: &parsed::ParseProgram,
-    initial_namespace: namespace::Module,
+    parse_program: &mut parsed::ParseProgram,
+    initial_namespace: namespace::Root,
     build_config: Option<&BuildConfig>,
     package_name: &str,
     retrigger_compilation: Option<Arc<AtomicBool>>,
 ) -> Result<ty::TyProgram, ErrorEmitted> {
-    let experimental = build_config.map(|x| x.experimental).unwrap_or_default();
+    let experimental = build_config
+        .map(|x| x.experimental)
+        .unwrap_or(ExperimentalFlags {
+            new_encoding: false,
+        });
     let lsp_config = build_config.map(|x| x.lsp_mode.clone()).unwrap_or_default();
+
+    // Build the dependency graph for the submodules.
+    build_module_dep_graph(handler, &mut parse_program.root)?;
+
+    // Collect the program symbols.
+    let _collection_ctx =
+        ty::TyProgram::collect(handler, engines, parse_program, initial_namespace.clone())?;
 
     // Type check the program.
     let typed_program_opt = ty::TyProgram::type_check(
@@ -491,11 +548,10 @@ pub fn parsed_to_ast(
         package_name,
         build_config,
     );
-
     check_should_abort(handler, retrigger_compilation.clone())?;
 
     // Only clear the parsed AST nodes if we are running a regular compilation pipeline.
-    // LSP needs these to build its token map, and they are cleared by `clear_module` as
+    // LSP needs these to build its token map, and they are cleared by `clear_program` as
     // part of the LSP garbage collection functionality instead.
     if lsp_config.is_none() {
         engines.pe().clear();
@@ -517,15 +573,11 @@ pub fn parsed_to_ast(
     };
 
     // Skip collecting metadata if we triggered an optimised build from LSP.
-    let types_metadata = if !lsp_config
-        .as_ref()
-        .map(|lsp| lsp.optimized_build)
-        .unwrap_or(false)
-    {
+    let types_metadata = if !lsp_config.as_ref().is_some_and(|lsp| lsp.optimized_build) {
         // Collect information about the types used in this program
         let types_metadata_result = typed_program.collect_types_metadata(
             handler,
-            &mut CollectTypesMetadataContext::new(engines, experimental),
+            &mut CollectTypesMetadataContext::new(engines, experimental, package_name.to_string()),
         );
         let types_metadata = match types_metadata_result {
             Ok(types_metadata) => types_metadata,
@@ -587,7 +639,7 @@ pub fn parsed_to_ast(
         &mut ctx,
         &mut md_mgr,
         module,
-        typed_program.root.namespace.module(),
+        typed_program.root.namespace.module(engines),
     ) {
         handler.emit_err(e);
     }
@@ -638,24 +690,22 @@ pub fn compile_to_ast(
     handler: &Handler,
     engines: &Engines,
     input: Arc<str>,
-    initial_namespace: namespace::Module,
+    initial_namespace: namespace::Root,
     build_config: Option<&BuildConfig>,
     package_name: &str,
     retrigger_compilation: Option<Arc<AtomicBool>>,
 ) -> Result<Programs, ErrorEmitted> {
     check_should_abort(handler, retrigger_compilation.clone())?;
-
     let query_engine = engines.qe();
     let mut metrics = PerformanceData::default();
-
     if let Some(config) = build_config {
         let path = config.canonical_root_module();
         let include_tests = config.include_tests;
 
         // Check if we can re-use the data in the cache.
-        if is_parse_module_cache_up_to_date(engines, &path, include_tests) {
+        if is_parse_module_cache_up_to_date(engines, &path, include_tests, build_config) {
             let mut entry = query_engine.get_programs_cache_entry(&path).unwrap();
-            entry.programs.metrics.reused_modules += 1;
+            entry.programs.metrics.reused_programs += 1;
 
             let (warnings, errors) = entry.handler_data;
             let new_handler = Handler::from_parts(warnings, errors);
@@ -684,10 +734,7 @@ pub fn compile_to_ast(
     };
 
     // If tests are not enabled, exclude them from `parsed_program`.
-    if build_config
-        .map(|config| !config.include_tests)
-        .unwrap_or(true)
-    {
+    if build_config.map_or(true, |config| !config.include_tests) {
         parsed_program.exclude_tests(engines);
     }
 
@@ -698,7 +745,7 @@ pub fn compile_to_ast(
         parsed_to_ast(
             handler,
             engines,
-            &parsed_program,
+            &mut parsed_program,
             initial_namespace,
             build_config,
             package_name,
@@ -735,8 +782,8 @@ pub fn compile_to_asm(
     handler: &Handler,
     engines: &Engines,
     input: Arc<str>,
-    initial_namespace: namespace::Module,
-    build_config: BuildConfig,
+    initial_namespace: namespace::Root,
+    build_config: &BuildConfig,
     package_name: &str,
 ) -> Result<CompiledAsm, ErrorEmitted> {
     let ast_res = compile_to_ast(
@@ -744,11 +791,11 @@ pub fn compile_to_asm(
         engines,
         input,
         initial_namespace,
-        Some(&build_config),
+        Some(build_config),
         package_name,
         None,
     )?;
-    ast_to_asm(handler, engines, &ast_res, &build_config)
+    ast_to_asm(handler, engines, &ast_res, build_config)
 }
 
 /// Given an AST compilation result, try compiling to a `CompiledAsm`,
@@ -801,7 +848,7 @@ pub(crate) fn compile_ast_to_ir_to_asm(
         Err(errors) => {
             let mut last = None;
             for e in errors {
-                last = Some(handler.emit_err(e))
+                last = Some(handler.emit_err(e));
             }
             return Err(last.unwrap());
         }
@@ -833,8 +880,16 @@ pub(crate) fn compile_ast_to_ir_to_asm(
             pass_group.append_group(create_o1_pass_group());
         }
         OptLevel::Opt0 => {
+            // We run a function deduplication pass that only removes duplicate
+            // functions when everything, including the metadata are identical.
+            pass_group.append_pass(FN_DEDUP_DEBUG_PROFILE_NAME);
+
             // Inlining is necessary until #4899 is resolved.
-            pass_group.append_pass(INLINE_MODULE_NAME);
+            pass_group.append_pass(FN_INLINE_NAME);
+
+            // Do DCE so other optimizations run faster.
+            pass_group.append_pass(FN_DCE_NAME);
+            pass_group.append_pass(DCE_NAME);
         }
     }
 
@@ -844,17 +899,17 @@ pub(crate) fn compile_ast_to_ir_to_asm(
         //
         // Demote large by-value constants, arguments and return values to by-reference values
         // using temporaries.
-        pass_group.append_pass(CONSTDEMOTION_NAME);
-        pass_group.append_pass(ARGDEMOTION_NAME);
-        pass_group.append_pass(RETDEMOTION_NAME);
-        pass_group.append_pass(MISCDEMOTION_NAME);
+        pass_group.append_pass(CONST_DEMOTION_NAME);
+        pass_group.append_pass(ARG_DEMOTION_NAME);
+        pass_group.append_pass(RET_DEMOTION_NAME);
+        pass_group.append_pass(MISC_DEMOTION_NAME);
 
-        // Convert loads and stores to mem_copys where possible.
+        // Convert loads and stores to mem_copies where possible.
         pass_group.append_pass(MEMCPYOPT_NAME);
 
         // Run a DCE and simplify-cfg to clean up any obsolete instructions.
         pass_group.append_pass(DCE_NAME);
-        pass_group.append_pass(SIMPLIFYCFG_NAME);
+        pass_group.append_pass(SIMPLIFY_CFG_NAME);
 
         match build_config.optimization_level {
             OptLevel::Opt1 => {
@@ -866,19 +921,17 @@ pub(crate) fn compile_ast_to_ir_to_asm(
         }
     }
 
-    if build_config.print_ir {
-        pass_group.append_pass(MODULEPRINTER_NAME);
-    }
-
     // Run the passes.
-    let res = if let Err(ir_error) = pass_mgr.run(&mut ir, &pass_group) {
-        Err(handler.emit_err(CompileError::InternalOwned(
-            ir_error.to_string(),
-            span::Span::dummy(),
-        )))
-    } else {
-        Ok(())
-    };
+    let print_passes_opts: PrintPassesOpts = (&build_config.print_ir).into();
+    let res =
+        if let Err(ir_error) = pass_mgr.run_with_print(&mut ir, &pass_group, &print_passes_opts) {
+            Err(handler.emit_err(CompileError::InternalOwned(
+                ir_error.to_string(),
+                span::Span::dummy(),
+            )))
+        } else {
+            Ok(())
+        };
     res?;
 
     let final_asm = compile_ir_to_asm(handler, &ir, Some(build_config))?;
@@ -892,8 +945,8 @@ pub fn compile_to_bytecode(
     handler: &Handler,
     engines: &Engines,
     input: Arc<str>,
-    initial_namespace: namespace::Module,
-    build_config: BuildConfig,
+    initial_namespace: namespace::Root,
+    build_config: &BuildConfig,
     source_map: &mut SourceMap,
     package_name: &str,
 ) -> Result<CompiledBytecode, ErrorEmitted> {
@@ -905,7 +958,7 @@ pub fn compile_to_bytecode(
         build_config,
         package_name,
     )?;
-    asm_to_bytecode(handler, asm_res, source_map, engines.se())
+    asm_to_bytecode(handler, asm_res, source_map, engines.se(), build_config)
 }
 
 /// Given the assembly (opcodes), compile to [CompiledBytecode], containing the asm in bytecode form.
@@ -914,8 +967,11 @@ pub fn asm_to_bytecode(
     mut asm: CompiledAsm,
     source_map: &mut SourceMap,
     source_engine: &SourceEngine,
+    build_config: &BuildConfig,
 ) -> Result<CompiledBytecode, ErrorEmitted> {
-    let compiled_bytecode = asm.0.to_bytecode_mut(handler, source_map, source_engine)?;
+    let compiled_bytecode =
+        asm.0
+            .to_bytecode_mut(handler, source_map, source_engine, build_config)?;
     Ok(compiled_bytecode)
 }
 
@@ -954,7 +1010,7 @@ fn dead_code_analysis<'a>(
     program: &ty::TyProgram,
 ) -> Result<ControlFlowGraph<'a>, ErrorEmitted> {
     let decl_engine = engines.de();
-    let mut dead_code_graph = Default::default();
+    let mut dead_code_graph = ControlFlowGraph::new(engines);
     let tree_type = program.kind.tree_type();
     module_dead_code_analysis(
         handler,
@@ -965,7 +1021,7 @@ fn dead_code_analysis<'a>(
     )?;
     let warnings = dead_code_graph.find_dead_code(decl_engine);
     for warn in warnings {
-        handler.emit_warn(warn)
+        handler.emit_warn(warn);
     }
     Ok(dead_code_graph)
 }
@@ -978,10 +1034,13 @@ fn module_dead_code_analysis<'eng: 'cfg, 'cfg>(
     tree_type: &parsed::TreeType,
     graph: &mut ControlFlowGraph<'cfg>,
 ) -> Result<(), ErrorEmitted> {
-    module.submodules.iter().try_fold((), |_, (_, submodule)| {
-        let tree_type = parsed::TreeType::Library;
-        module_dead_code_analysis(handler, engines, &submodule.module, &tree_type, graph)
-    })?;
+    module
+        .submodules
+        .iter()
+        .try_fold((), |(), (_, submodule)| {
+            let tree_type = parsed::TreeType::Library;
+            module_dead_code_analysis(handler, engines, &submodule.module, &tree_type, graph)
+        })?;
     let res = {
         ControlFlowGraph::append_module_to_dead_code_graph(
             engines,

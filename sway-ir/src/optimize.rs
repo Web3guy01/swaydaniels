@@ -54,7 +54,7 @@ pub mod tests {
     ///
     /// ```rust, ignore
     /// assert_optimization(
-    ///     &["constcombine"],
+    ///     &[CONST_FOLDING_NAME],
     ///     "entry fn main() -> u64 {
     ///        entry():
     ///             l = const u64 1
@@ -81,7 +81,9 @@ pub mod tests {
             "
             ),
             &source_engine,
-            ExperimentalFlags::default(),
+            ExperimentalFlags {
+                new_encoding: false,
+            },
         )
         .unwrap();
 

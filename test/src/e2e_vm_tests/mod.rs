@@ -7,10 +7,10 @@ use crate::e2e_vm_tests::harness::run_and_capture_output;
 use crate::{FilterConfig, RunConfig};
 
 use anyhow::{anyhow, bail, Result};
-use assert_matches::assert_matches;
 use colored::*;
 use core::fmt;
 use forc_pkg::BuildProfile;
+use forc_test::decode_log_data;
 use fuel_vm::fuel_tx;
 use fuel_vm::prelude::*;
 use regex::Regex;
@@ -18,6 +18,7 @@ use std::collections::HashSet;
 use std::io::stdout;
 use std::io::Write;
 use std::str::FromStr;
+use std::time::Instant;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -29,7 +30,7 @@ use tracing::Instrument;
 
 use self::util::VecExt;
 
-#[derive(PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 enum TestCategory {
     Compiles,
     FailsToCompile,
@@ -39,7 +40,7 @@ enum TestCategory {
     Disabled,
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 enum TestResult {
     Result(Word),
     Return(u64),
@@ -58,25 +59,57 @@ impl fmt::Debug for TestResult {
     }
 }
 
+#[derive(Clone)]
+pub struct FileCheck(String);
+
+impl FileCheck {
+    pub fn build(&self) -> Result<filecheck::Checker, anyhow::Error> {
+        const DIRECTIVE_RX: &str = r"(?m)^\s*#\s*(\w+):\s+(.*)$";
+
+        let mut checker = filecheck::CheckerBuilder::new();
+
+        // Parse the file and check for unknown FileCheck directives.
+        let re = Regex::new(DIRECTIVE_RX).unwrap();
+        for cap in re.captures_iter(&self.0) {
+            if let Ok(false) = checker.directive(&cap[0]) {
+                bail!("Unknown FileCheck directive: {}", &cap[1]);
+            }
+        }
+
+        Ok(checker.finish())
+    }
+}
+
+#[derive(Clone)]
 struct TestDescription {
     name: String,
+    suffix: Option<String>,
     category: TestCategory,
     script_data: Option<Vec<u8>>,
+    script_data_new_encoding: Option<Vec<u8>>,
     witness_data: Option<Vec<Vec<u8>>>,
     expected_result: Option<TestResult>,
+    expected_result_new_encoding: Option<TestResult>,
     expected_warnings: u32,
     contract_paths: Vec<String>,
     validate_abi: bool,
     validate_storage_slots: bool,
     supported_targets: HashSet<BuildTarget>,
+    expected_decoded_test_logs: Option<Vec<String>>,
     unsupported_profiles: Vec<&'static str>,
-    checker: filecheck::Checker,
+    checker: FileCheck,
+    run_config: RunConfig,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct DeployedContractKey {
+    pub contract_path: String,
+    pub new_encoding: bool,
 }
 
 #[derive(Clone)]
 struct TestContext {
-    run_config: RunConfig,
-    deployed_contracts: Arc<Mutex<HashMap<String, ContractId>>>,
+    deployed_contracts: Arc<Mutex<HashMap<DeployedContractKey, ContractId>>>,
 }
 
 fn print_receipts(output: &mut String, receipts: &[Receipt]) {
@@ -208,53 +241,68 @@ fn print_receipts(output: &mut String, receipts: &[Receipt]) {
 }
 
 impl TestContext {
-    async fn deploy_contract(&self, contract_path: String) -> Result<ContractId> {
+    async fn deploy_contract(
+        &self,
+        run_config: &RunConfig,
+        contract_path: String,
+    ) -> Result<ContractId> {
+        let key = DeployedContractKey {
+            contract_path: contract_path.clone(),
+            new_encoding: run_config.experimental.new_encoding,
+        };
+
         let mut deployed_contracts = self.deployed_contracts.lock().await;
-        Ok(
-            if let Some(contract_id) = deployed_contracts.get(&contract_path) {
-                *contract_id
-            } else {
-                let contract_id =
-                    harness::deploy_contract(contract_path.as_str(), &self.run_config).await?;
-                deployed_contracts.insert(contract_path, contract_id);
-                contract_id
-            },
-        )
+        Ok(if let Some(contract_id) = deployed_contracts.get(&key) {
+            *contract_id
+        } else {
+            let contract_id = harness::deploy_contract(contract_path.as_str(), run_config).await?;
+            deployed_contracts.insert(key, contract_id);
+            contract_id
+        })
     }
+
     async fn run(&self, test: TestDescription, output: &mut String, verbose: bool) -> Result<()> {
-        let context = self;
         let TestDescription {
             name,
             category,
             script_data,
+            script_data_new_encoding,
             witness_data,
             expected_result,
+            expected_result_new_encoding,
             expected_warnings,
             contract_paths,
             validate_abi,
             validate_storage_slots,
             checker,
+            run_config,
+            expected_decoded_test_logs,
             ..
         } = test;
 
+        let checker = checker.build().unwrap();
+
+        let script_data = if run_config.experimental.new_encoding {
+            script_data_new_encoding
+        } else {
+            script_data
+        };
+
+        let expected_result = if run_config.experimental.new_encoding {
+            expected_result_new_encoding
+        } else {
+            expected_result
+        };
+
         match category {
             TestCategory::Runs => {
-                let res = match expected_result {
-                    Some(TestResult::Return(_))
-                    | Some(TestResult::ReturnData(_))
-                    | Some(TestResult::Revert(_)) => expected_result.unwrap(),
+                let expected_result = expected_result.expect("No expected result found. This is likely because test.toml is missing either an \"expected_result_new_encoding\" or \"expected_result\" entry");
 
-                    _ => panic!(
-                        "For {name}:\n\
-                        Invalid expected result for a 'runs' test: {expected_result:?}."
-                    ),
-                };
-
-                let (result, out) = run_and_capture_output(|| {
-                    harness::compile_to_bytes(&name, &context.run_config)
-                })
-                .await;
+                let (result, out) =
+                    run_and_capture_output(|| harness::compile_to_bytes(&name, &run_config)).await;
                 *output = out;
+
+                check_file_checker(checker, &name, output)?;
 
                 let compiled = result?;
 
@@ -273,7 +321,7 @@ impl TestContext {
                 }
 
                 let result = harness::runs_in_vm(compiled.clone(), script_data, witness_data)?;
-                let result = match result {
+                let actual_result = match result {
                     harness::VMExecutionResult::Fuel(state, receipts) => {
                         print_receipts(output, &receipts);
                         match state {
@@ -316,14 +364,19 @@ impl TestContext {
                     }
                 };
 
-                if result != res {
+                if actual_result != expected_result {
                     Err(anyhow::Error::msg(format!(
-                        "expected: {res:?}\nactual: {result:?}"
+                        "expected: {expected_result:?}\nactual: {actual_result:?}"
                     )))
                 } else {
                     if validate_abi {
                         let (result, out) = run_and_capture_output(|| async {
-                            harness::test_json_abi(&name, &compiled)
+                            harness::test_json_abi(
+                                &name,
+                                &compiled,
+                                run_config.experimental.new_encoding,
+                                run_config.update_output_files,
+                            )
                         })
                         .await;
                         output.push_str(&out);
@@ -334,10 +387,8 @@ impl TestContext {
             }
 
             TestCategory::Compiles => {
-                let (result, out) = run_and_capture_output(|| {
-                    harness::compile_to_bytes(&name, &context.run_config)
-                })
-                .await;
+                let (result, out) =
+                    run_and_capture_output(|| harness::compile_to_bytes(&name, &run_config)).await;
                 *output = out;
 
                 let compiled_pkgs = match result? {
@@ -366,7 +417,12 @@ impl TestContext {
                 if validate_abi {
                     for (name, built_pkg) in &compiled_pkgs {
                         let (result, out) = run_and_capture_output(|| async {
-                            harness::test_json_abi(name, built_pkg)
+                            harness::test_json_abi(
+                                name,
+                                built_pkg,
+                                run_config.experimental.new_encoding,
+                                run_config.update_output_files,
+                            )
                         })
                         .await;
                         result?;
@@ -388,13 +444,16 @@ impl TestContext {
             }
 
             TestCategory::FailsToCompile => {
-                let (result, out) = run_and_capture_output(|| {
-                    harness::compile_to_bytes(&name, &context.run_config)
-                })
-                .await;
+                let (result, out) =
+                    run_and_capture_output(|| harness::compile_to_bytes(&name, &run_config)).await;
+
                 *output = out;
 
                 if result.is_ok() {
+                    if verbose {
+                        eprintln!("[{}]", output);
+                    }
+
                     Err(anyhow::Error::msg("Test compiles but is expected to fail"))
                 } else {
                     check_file_checker(checker, &name, output)?;
@@ -403,15 +462,6 @@ impl TestContext {
             }
 
             TestCategory::RunsWithContract => {
-                let val = if let Some(TestResult::Result(val)) = expected_result {
-                    val
-                } else {
-                    panic!(
-                        "For {name}:\nExpecting a 'result' action for a 'run_on_node' test, \
-                        found: {expected_result:?}."
-                    )
-                };
-
                 if contract_paths.is_empty() {
                     panic!(
                         "For {name}\n\
@@ -422,19 +472,25 @@ impl TestContext {
                 let mut contract_ids = Vec::new();
                 for contract_path in contract_paths.clone() {
                     let (result, out) = run_and_capture_output(|| async {
-                        context.deploy_contract(contract_path).await
+                        self.deploy_contract(&run_config, contract_path).await
                     })
                     .await;
                     output.push_str(&out);
                     contract_ids.push(result);
                 }
                 let contract_ids = contract_ids.into_iter().collect::<Result<Vec<_>, _>>()?;
-                let (result, out) =
-                    harness::runs_on_node(&name, &context.run_config, &contract_ids).await;
+
+                let (result, out) = harness::runs_on_node(&name, &run_config, &contract_ids).await;
+
                 output.push_str(&out);
 
-                let receipt = result?;
-                if !receipt.iter().all(|res| {
+                let receipts = result?;
+
+                if verbose {
+                    print_receipts(output, &receipts);
+                }
+
+                if !receipts.iter().all(|res| {
                     !matches!(
                         res,
                         fuel_tx::Receipt::Revert { .. } | fuel_tx::Receipt::Panic { .. }
@@ -444,19 +500,50 @@ impl TestContext {
                     for cid in contract_ids {
                         println!("Deployed contract: 0x{cid}");
                     }
-                    panic!("Receipts contain reverts or panics: {receipt:?}");
+
+                    return Err(anyhow::Error::msg("Receipts contain reverts or panics"));
                 }
-                assert!(receipt.len() >= 2);
-                assert_matches!(receipt[receipt.len() - 2], fuel_tx::Receipt::Return { .. });
-                assert_eq!(receipt[receipt.len() - 2].val().unwrap(), val);
+
+                if receipts.len() < 2 {
+                    return Err(anyhow::Error::msg(format!(
+                        "less than 2 receipts: {:?} receipts",
+                        receipts.len()
+                    )));
+                }
+
+                match &receipts[receipts.len() - 2] {
+                    Receipt::Return { val, .. } => match expected_result.unwrap() {
+                        TestResult::Result(v) => {
+                            if v != *val {
+                                return Err(anyhow::Error::msg(format!(
+                                    "return value does not match expected: {v:?}, {val:?}"
+                                )));
+                            }
+                        }
+                        _ => todo!(),
+                    },
+                    Receipt::ReturnData { data, .. } => match expected_result.unwrap() {
+                        TestResult::ReturnData(v) => {
+                            if v != *data.as_ref().unwrap() {
+                                return Err(anyhow::Error::msg(format!(
+                                    "return value does not match expected: {v:?}, {data:?}"
+                                )));
+                            }
+                        }
+                        _ => todo!(),
+                    },
+                    _ => {}
+                };
 
                 Ok(())
             }
 
             TestCategory::UnitTestsPass => {
                 let (result, out) =
-                    harness::compile_and_run_unit_tests(&name, &context.run_config, true).await;
+                    harness::compile_and_run_unit_tests(&name, &run_config, true).await;
                 *output = out;
+
+                let mut decoded_logs = vec![];
 
                 result.map(|tested_pkgs| {
                     let mut failed = vec![];
@@ -466,6 +553,32 @@ impl TestContext {
                                 println!("Test: {} {}", test.name, test.passed());
                                 for log in test.logs.iter() {
                                     println!("{:?}", log);
+                                }
+                            }
+
+                            if expected_decoded_test_logs.is_some() {
+                                for log in test.logs.iter() {
+                                    if let Receipt::LogData {
+                                        rb,
+                                        data: Some(data),
+                                        ..
+                                    } = log
+                                    {
+                                        let decoded_log_data = decode_log_data(
+                                            &rb.to_string(),
+                                            data,
+                                            &pkg.built.program_abi,
+                                        )
+                                        .unwrap();
+                                        let var_value = decoded_log_data.value;
+                                        if verbose {
+                                            println!(
+                                                "Decoded log value: {}, log rb: {}",
+                                                var_value, rb
+                                            );
+                                        }
+                                        decoded_logs.push(var_value);
+                                    }
                                 }
                             }
 
@@ -481,12 +594,20 @@ impl TestContext {
                         }
                     }
 
+                    let expected_decoded_test_logs = expected_decoded_test_logs.unwrap_or_default();
+
                     if !failed.is_empty() {
                         println!("FAILED!! output:\n{}", output);
                         panic!(
                             "For {name}\n{} tests failed:\n{}",
                             failed.len(),
                             failed.into_iter().collect::<String>()
+                        );
+                    } else if expected_decoded_test_logs != decoded_logs {
+                        println!("FAILED!! output:\n{}", output);
+                        panic!(
+                            "For {name}\ncollected decoded logs: {:?}\nexpected decoded logs: {:?}",
+                            decoded_logs, expected_decoded_test_logs
                         );
                     }
                 })
@@ -501,7 +622,7 @@ impl TestContext {
 
 pub async fn run(filter_config: &FilterConfig, run_config: &RunConfig) -> Result<()> {
     // Discover tests
-    let mut tests = discover_test_configs()?;
+    let mut tests = discover_test_configs(run_config)?;
     let total_number_of_tests = tests.len();
 
     // Filter tests
@@ -541,24 +662,63 @@ pub async fn run(filter_config: &FilterConfig, run_config: &RunConfig) -> Result
     if filter_config.first_only && !tests.is_empty() {
         tests = vec![tests.remove(0)];
     }
-    let cur_profile = if run_config.release {
-        BuildProfile::RELEASE
-    } else {
-        BuildProfile::DEBUG
-    };
-    tests.retain(|t| !t.unsupported_profiles.contains(&cur_profile));
+
+    // Expand tests that need to run with multiple configurations.
+    // Be mindful that this can explode exponentially the number of tests
+    // that run because one expansion expands on top of another
+    let mut tests = tests;
+    let expansions: [&str; 0] = [];
+    for expansion in expansions {
+        tests = tests
+            .into_iter()
+            .flat_map(|t| {
+                let has_script_data_new_encoding = t.script_data_new_encoding.is_some();
+                let has_contracts = !t.contract_paths.is_empty();
+                let has_expected_return = t.expected_result_new_encoding.is_some();
+                if expansion == "new_encoding"
+                    && (has_script_data_new_encoding || has_contracts || has_expected_return)
+                {
+                    let mut with_new_encoding = t.clone();
+                    with_new_encoding.suffix = Some("New Encoding".into());
+
+                    let mut run_config_with_new_encoding = run_config.clone();
+                    run_config_with_new_encoding.experimental.new_encoding = true;
+                    with_new_encoding.run_config = run_config_with_new_encoding;
+
+                    vec![t, with_new_encoding]
+                } else {
+                    vec![t]
+                }
+            })
+            .collect();
+    }
 
     // Run tests
     let context = TestContext {
-        run_config: run_config.clone(),
         deployed_contracts: Default::default(),
     };
     let mut number_of_tests_executed = 0;
     let mut number_of_tests_failed = 0;
     let mut failed_tests = vec![];
 
+    let start_time = Instant::now();
     for (i, test) in tests.into_iter().enumerate() {
-        let name = test.name.clone();
+        let cur_profile = if run_config.release {
+            BuildProfile::RELEASE
+        } else {
+            BuildProfile::DEBUG
+        };
+
+        if test.unsupported_profiles.contains(&cur_profile) {
+            continue;
+        }
+
+        let name = if let Some(suffix) = test.suffix.as_ref() {
+            format!("{} ({})", test.name, suffix)
+        } else {
+            test.name.clone()
+        };
+
         print!("Testing {} ...", name.clone().bold());
         stdout().flush().unwrap();
 
@@ -597,25 +757,26 @@ pub async fn run(filter_config: &FilterConfig, run_config: &RunConfig) -> Result
 
         number_of_tests_executed += 1;
     }
+    let duration = Instant::now().duration_since(start_time);
 
     if number_of_tests_executed == 0 {
         if let Some(skip_until) = &filter_config.skip_until {
             tracing::info!(
-                "Filtered {} tests with `skip-until` regex: {}",
+                "Filtered {} tests with `skip-until` regex: {:?}",
                 skipped_tests.len(),
                 skip_until.to_string()
             );
         }
         if let Some(include) = &filter_config.include {
             tracing::info!(
-                "Filtered {} tests with `include` regex: {}",
+                "Filtered {} tests with `include` regex: {:?}",
                 included_tests.len(),
                 include.to_string()
             );
         }
         if let Some(exclude) = &filter_config.exclude {
             tracing::info!(
-                "Filtered {} tests with `exclude` regex: {}",
+                "Filtered {} tests with `exclude` regex: {:?}",
                 excluded_tests.len(),
                 exclude.to_string()
             );
@@ -630,7 +791,7 @@ pub async fn run(filter_config: &FilterConfig, run_config: &RunConfig) -> Result
     } else {
         tracing::info!("_________________________________");
         tracing::info!(
-            "Sway tests result: {}. {} total, {} passed; {} failed; {} disabled",
+            "Sway tests result: {}. {} total, {} passed; {} failed; {} disabled [test duration: {}]",
             if number_of_tests_failed == 0 {
                 "ok".green().bold()
             } else {
@@ -639,7 +800,8 @@ pub async fn run(filter_config: &FilterConfig, run_config: &RunConfig) -> Result
             total_number_of_tests,
             number_of_tests_executed - number_of_tests_failed,
             number_of_tests_failed,
-            disabled_tests.len()
+            disabled_tests.len(),
+            util::duration_to_str(&duration)
         );
         if number_of_tests_failed > 0 {
             tracing::info!("{}", "Failing tests:".red().bold());
@@ -660,8 +822,12 @@ pub async fn run(filter_config: &FilterConfig, run_config: &RunConfig) -> Result
     }
 }
 
-fn discover_test_configs() -> Result<Vec<TestDescription>> {
-    fn recursive_search(path: &Path, configs: &mut Vec<TestDescription>) -> Result<()> {
+fn discover_test_configs(run_config: &RunConfig) -> Result<Vec<TestDescription>> {
+    fn recursive_search(
+        path: &Path,
+        run_config: &RunConfig,
+        configs: &mut Vec<TestDescription>,
+    ) -> Result<()> {
         let wrap_err = |e| {
             let relative_path = path
                 .iter()
@@ -672,10 +838,10 @@ fn discover_test_configs() -> Result<Vec<TestDescription>> {
         };
         if path.is_dir() {
             for entry in std::fs::read_dir(path).unwrap() {
-                recursive_search(&entry.unwrap().path(), configs)?;
+                recursive_search(&entry.unwrap().path(), run_config, configs)?;
             }
         } else if path.is_file() && path.file_name().map(|f| f == "test.toml").unwrap_or(false) {
-            configs.push(parse_test_toml(path).map_err(wrap_err)?);
+            configs.push(parse_test_toml(path, run_config).map_err(wrap_err)?);
         }
         Ok(())
     }
@@ -684,24 +850,8 @@ fn discover_test_configs() -> Result<Vec<TestDescription>> {
     let tests_root_dir = format!("{manifest_dir}/src/e2e_vm_tests/test_programs");
 
     let mut configs = Vec::new();
-    recursive_search(&PathBuf::from(tests_root_dir), &mut configs)?;
+    recursive_search(&PathBuf::from(tests_root_dir), run_config, &mut configs)?;
     Ok(configs)
-}
-
-const DIRECTIVE_RX: &str = r"(?m)^\s*#\s*(\w+):\s+(.*)$";
-
-fn build_file_checker(content: &str) -> Result<filecheck::Checker> {
-    let mut checker = filecheck::CheckerBuilder::new();
-
-    // Parse the file and check for unknown FileCheck directives.
-    let re = Regex::new(DIRECTIVE_RX).unwrap();
-    for cap in re.captures_iter(content) {
-        if let Ok(false) = checker.directive(&cap[0]) {
-            bail!("Unknown FileCheck directive: {}", &cap[1]);
-        }
-    }
-
-    Ok(checker.finish())
 }
 
 /// This functions gets passed the previously built FileCheck-based file checker,
@@ -720,10 +870,11 @@ fn check_file_checker(checker: filecheck::Checker, name: &String, output: &str) 
     }
 }
 
-fn parse_test_toml(path: &Path) -> Result<TestDescription> {
+fn parse_test_toml(path: &Path, run_config: &RunConfig) -> Result<TestDescription> {
     let toml_content_str = std::fs::read_to_string(path)?;
 
-    let checker = build_file_checker(&toml_content_str)?;
+    let file_check = FileCheck(toml_content_str.clone());
+    let checker = file_check.build()?;
 
     let toml_content = toml_content_str.parse::<toml::Value>()?;
 
@@ -747,16 +898,29 @@ fn parse_test_toml(path: &Path) -> Result<TestDescription> {
             Some(other) => Err(anyhow!("Unknown category '{}'.", other)),
         })?;
 
+    let expected_decoded_test_logs = if let Some(toml::Value::Array(a)) =
+        toml_content.get("expected_decoded_test_logs")
+    {
+        if category != TestCategory::UnitTestsPass {
+            bail!("`expected_decoded_test_logs` is only valid for `unt_tests_pass` type of tests")
+        }
+        a.iter()
+            .map(|elem| elem.as_str().map(|s| s.to_string()))
+            .collect::<Option<Vec<_>>>()
+    } else {
+        None
+    };
+
     // Abort early if we find a FailsToCompile test without any Checker directives.
     if category == TestCategory::FailsToCompile && checker.is_empty() {
         bail!("'fail' tests must contain some FileCheck verification directives.");
     }
 
-    let script_data = match &category {
+    let (script_data, script_data_new_encoding) = match &category {
         TestCategory::Runs | TestCategory::RunsWithContract => {
-            match toml_content.get("script_data") {
+            let script_data = match toml_content.get("script_data") {
                 Some(toml::Value::String(v)) => {
-                    let decoded = hex::decode(v)
+                    let decoded = hex::decode(v.replace(' ', ""))
                         .map_err(|e| anyhow!("Invalid hex value for 'script_data': {}", e))?;
                     Some(decoded)
                 }
@@ -764,12 +928,26 @@ fn parse_test_toml(path: &Path) -> Result<TestDescription> {
                     bail!("Expected 'script_data' to be a hex string.");
                 }
                 _ => None,
-            }
+            };
+
+            let script_data_new_encoding = match toml_content.get("script_data_new_encoding") {
+                Some(toml::Value::String(v)) => {
+                    let decoded = hex::decode(v.replace(' ', ""))
+                        .map_err(|e| anyhow!("Invalid hex value for 'script_data': {}", e))?;
+                    Some(decoded)
+                }
+                Some(_) => {
+                    bail!("Expected 'script_data' to be a hex string.");
+                }
+                _ => None,
+            };
+
+            (script_data, script_data_new_encoding)
         }
         TestCategory::Compiles
         | TestCategory::FailsToCompile
         | TestCategory::UnitTestsPass
-        | TestCategory::Disabled => None,
+        | TestCategory::Disabled => (None, None),
     };
 
     let witness_data = match &category {
@@ -806,12 +984,20 @@ fn parse_test_toml(path: &Path) -> Result<TestDescription> {
 
     let expected_result = match &category {
         TestCategory::Runs | TestCategory::RunsWithContract => {
-            Some(get_expected_result(&toml_content)?)
+            Some(get_expected_result("expected_result", &toml_content)?)
         }
         TestCategory::Compiles
         | TestCategory::FailsToCompile
         | TestCategory::UnitTestsPass
         | TestCategory::Disabled => None,
+    };
+
+    let expected_result_new_encoding = match (
+        &category,
+        get_expected_result("expected_result_new_encoding", &toml_content),
+    ) {
+        (TestCategory::Runs | TestCategory::RunsWithContract, Ok(value)) => Some(value),
+        _ => None,
     };
 
     let contract_paths = match toml_content.get("contracts") {
@@ -891,17 +1077,22 @@ fn parse_test_toml(path: &Path) -> Result<TestDescription> {
 
     Ok(TestDescription {
         name,
+        suffix: None,
         category,
         script_data,
+        script_data_new_encoding,
         witness_data,
         expected_result,
+        expected_result_new_encoding,
         expected_warnings,
         contract_paths,
         validate_abi,
         validate_storage_slots,
         supported_targets,
         unsupported_profiles,
-        checker,
+        checker: file_check,
+        run_config: run_config.clone(),
+        expected_decoded_test_logs,
     })
 }
 
@@ -926,7 +1117,7 @@ fn get_build_profile_from_value(value: &toml::Value) -> Result<&'static str> {
     }
 }
 
-fn get_expected_result(toml_content: &toml::Value) -> Result<TestResult> {
+fn get_expected_result(key: &str, toml_content: &toml::Value) -> Result<TestResult> {
     fn get_action_value(action: &toml::Value, expected_value: &toml::Value) -> Result<TestResult> {
         match (action.as_str(), expected_value) {
             // A simple integer value.
@@ -936,7 +1127,7 @@ fn get_expected_result(toml_content: &toml::Value) -> Result<TestResult> {
             (Some("result"), toml::Value::Integer(v)) => Ok(TestResult::Result(*v as Word)),
 
             // A bytes32 value.
-            (Some("return_data"), toml::Value::String(v)) => hex::decode(v)
+            (Some("return_data"), toml::Value::String(v)) => hex::decode(v.replace(' ', ""))
                 .map(TestResult::ReturnData)
                 .map_err(|e| anyhow!("Invalid hex value for 'return_data': {}", e)),
 
@@ -948,7 +1139,7 @@ fn get_expected_result(toml_content: &toml::Value) -> Result<TestResult> {
     }
 
     toml_content
-        .get("expected_result")
+        .get(key)
         .ok_or_else(|| anyhow!( "Could not find mandatory 'expected_result' entry."))
         .and_then(|expected_result_table| {
             expected_result_table

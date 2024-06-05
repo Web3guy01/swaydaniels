@@ -6,15 +6,25 @@ use std::contract_id::*;
 use std::constants::DEFAULT_SUB_ID;
 use test_fuel_coin_abi::*;
 
+#[cfg(experimental_new_encoding = false)]
+const FUEL_COIN_CONTRACT_ID = 0x4c7b43ef5a097d7cfb87600a4234e33311eeeeb8081e5ea7bb6d9a1f8555c9c4;
+#[cfg(experimental_new_encoding = true)]
+const FUEL_COIN_CONTRACT_ID = 0x9c9f2f9d8e599a8a0261f5683973d5377d23835e5704d3d051a9c275a117b1a7;
+
+#[cfg(experimental_new_encoding = false)]
+const BALANCE_CONTRACT_ID = 0x3120fdd1b99c0c611308aff43a99746cc2c661c69c22aa56331d5f3ce5534ee9;
+#[cfg(experimental_new_encoding = true)]
+const BALANCE_CONTRACT_ID = 0xc28ea47d2e9720ae0379877f32f4555e9a305229f3e4ea44e82f9af62977fae8;
+
 fn main() -> bool {
     let default_gas = 1_000_000_000_000;
 
     // the deployed fuel_coin Contract_Id:
-    let fuelcoin_id = ContractId::from(0x5d10689c7eecb405937a3f35fab7baf05a3f6189f9a2993ee70e21ccc1212460);
+    let fuelcoin_id = ContractId::from(FUEL_COIN_CONTRACT_ID);
     let fuelcoin_asset_id = AssetId::new(fuelcoin_id, DEFAULT_SUB_ID);
 
     // contract ID for sway/test/src/e2e_vm_tests/test_programs/should_pass/test_contracts/balance_test_contract/
-    let balance_test_id = ContractId::from(0xe50966cd6b1da8fe006e3e876e08f3df6948ce426e1a7cfe49fba411b0a11f89);
+    let balance_test_id = ContractId::from(BALANCE_CONTRACT_ID);
 
     // todo: use correct type ContractId
     let fuel_coin = abi(TestFuelCoin, fuelcoin_id.into());
